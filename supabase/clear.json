@@ -1,0 +1,3 @@
+{
+  "query": "delete from public.persona_words"
+}

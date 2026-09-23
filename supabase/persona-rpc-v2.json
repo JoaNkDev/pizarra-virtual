@@ -1,0 +1,3 @@
+{
+  "query": "create or replace function public.submit_word(p_words text) returns void language plpgsql security definer as $$ declare v_ip inet := inet_client_addr(); v_count int; begin if v_ip is null then raise exception 'No se pudo determinar IP'; end if; v_count := array_length(regexp_split_to_array(trim(p_words), '\\s+'), 1); if v_count is null or v_count < 1 then raise exception 'Escribí al menos una palabra'; end if; if v_count > 2 then raise exception 'Maximo 2 palabras'; end if; insert into public.persona_words (user_id, words, ip, created_at) values ('ip:'||v_ip::text, trim(p_words), v_ip, now()) on conflict (ip) do update set words = excluded.words, created_at = excluded.created_at; end; $$;"
+}

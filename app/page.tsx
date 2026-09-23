@@ -117,10 +117,8 @@ export default function Home() {
     };
   }, [userId]);
 
-  const myWord = useMemo(
-    () => words.find((w) => w.userId === userId) ?? null,
-    [words, userId]
-  );
+  // Server tracks "yours" by IP via the RPC; we don't know our IP client-side
+  // (and don't need to for UI). Each submit upserts the IP's row.
 
   const validate = useCallback((text: string): string | null => {
     const trimmed = text.trim();
@@ -133,7 +131,7 @@ export default function Home() {
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
-      if (!supabase || !userId) return;
+      if (!supabase) return;
       const trimmed = input.trim();
       const err = validate(trimmed);
       if (err) {
@@ -142,14 +140,10 @@ export default function Home() {
       }
       setError(null);
       setSubmitting(true);
-      const { error } = await supabase.from("persona_words").upsert(
-        {
-          user_id: userId,
-          words: trimmed,
-          created_at: new Date().toISOString(),
-        },
-        { onConflict: "user_id" }
-      );
+      // Server-side enforced: max 2 words, unique per IP.
+      const { error } = await supabase.rpc("submit_word", {
+        p_words: trimmed,
+      });
       setSubmitting(false);
       if (error) {
         setError(error.message);
@@ -157,7 +151,7 @@ export default function Home() {
         setInput("");
       }
     },
-    [input, userId, validate]
+    [input, validate]
   );
 
   if (!isConfigured) {
@@ -199,11 +193,7 @@ export default function Home() {
                 setInput(e.target.value);
                 if (error) setError(null);
               }}
-              placeholder={
-                myWord
-                  ? `Cambiar tu palabra (${myWord.words})`
-                  : "ej: muy simpática"
-              }
+              placeholder="ej: muy simpática"
               maxLength={40}
               autoComplete="off"
               className="flex-1 rounded-xl border border-border bg-panel px-4 py-3 text-base outline-none placeholder:text-white/30 focus:border-accent"
@@ -213,20 +203,20 @@ export default function Home() {
               disabled={submitting || !input.trim()}
               className="rounded-xl bg-accent px-5 py-3 font-medium text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
             >
-              {myWord ? "Actualizar" : "Enviar"}
+              Enviar
             </button>
           </div>
           {error && (
             <p className="text-xs text-rose-400 text-center">{error}</p>
           )}
           <p className="text-xs text-white/40 text-center">
-            Máximo {MAX_WORDS} palabras. {myWord ? "Podés cambiar la tuya." : "Anónimo."}
+            Máximo {MAX_WORDS} palabras. Anónimo — un envío por IP.
           </p>
         </form>
       </section>
 
       {/* Collage */}
-      <section className="relative flex-1 min-h-[60vh] overflow-hidden">
+      <section className="relative flex-1 min-h-[60vh]">
         {words.length === 0 ? (
           <div className="absolute inset-0 grid place-items-center text-white/30 text-sm">
             Esperando las primeras descripciones…
@@ -241,56 +231,43 @@ export default function Home() {
 
 function Collage({ words }: { words: Word[] }) {
   return (
-    <div className="relative h-full w-full">
-      {words.map((w, i) => {
-        const layout = layoutFor(w.id, w.userId, i, words.length);
+    <div className="relative min-h-[60vh] w-full flex flex-wrap items-center justify-center content-center gap-x-6 gap-y-5 px-6 py-10">
+      {words.map((w) => {
+        const layout = layoutFor(w.id);
         return (
-          <div
+          <span
             key={w.id}
-            className="absolute select-none"
+            className="inline-block select-none text-center"
             style={{
-              left: `${layout.x}%`,
-              top: `${layout.y}%`,
-              transform: `translate(-50%, -50%) rotate(${layout.rot}deg)`,
               fontSize: `${layout.size}px`,
               color: layout.color,
               fontWeight: layout.weight,
-              letterSpacing: "-0.01em",
+              letterSpacing: "-0.02em",
               lineHeight: 1.1,
               fontFamily:
                 'Georgia, "Times New Roman", ui-serif, serif',
-              textShadow: "0 2px 12px rgba(0,0,0,0.45)",
-              maxWidth: "60vw",
-              whiteSpace: "nowrap",
+              textShadow: "0 2px 18px rgba(0,0,0,0.55)",
+              padding: "0.1em 0.25em",
             }}
           >
             {w.words}
-          </div>
+          </span>
         );
       })}
     </div>
   );
 }
 
-// Deterministic layout based on word id (stable across reloads)
-function layoutFor(
-  id: string,
-  userId: string,
-  index: number,
-  total: number
-): { x: number; y: number; rot: number; size: number; color: string; weight: number } {
+// Deterministic per-word style — stable across reloads.
+// No rotation so words look like they were written; size/color vary for collage feel.
+function layoutFor(id: string): {
+  size: number;
+  color: string;
+  weight: number;
+} {
   const seed = hash(id);
   const r = mulberry32(seed);
-  // Spread across canvas using poisson-like jitter from index
-  const cols = Math.max(1, Math.ceil(Math.sqrt(total)));
-  const row = Math.floor(index / cols);
-  const col = index % cols;
-  const baseX = ((col + 0.5) / cols) * 100;
-  const baseY = ((row + 0.5) / Math.max(1, Math.ceil(total / cols))) * 100;
-  const jitterX = (r() - 0.5) * 18;
-  const jitterY = (r() - 0.5) * 14;
-  const rot = (r() - 0.5) * 22; // -11°..+11°
-  const size = 28 + r() * 28; // 28..56px
+  const size = 30 + r() * 18; // 30..48px (readable range)
   const palette = [
     "#ffffff",
     "#ffd6a8",
@@ -302,15 +279,8 @@ function layoutFor(
     "#ffadad",
   ];
   const color = palette[Math.floor(r() * palette.length)];
-  const weight = r() > 0.5 ? 600 : 700;
-  return {
-    x: clamp(baseX + jitterX, 5, 95),
-    y: clamp(baseY + jitterY, 8, 92),
-    rot,
-    size,
-    color,
-    weight,
-  };
+  const weight = r() > 0.5 ? 700 : 500;
+  return { size, color, weight };
 }
 
 function hash(s: string): number {

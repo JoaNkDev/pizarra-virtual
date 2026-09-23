@@ -1,0 +1,3 @@
+{
+  "query": "select conname, contype from pg_constraint where conrelid = 'public.persona_words'::regclass"
+}
