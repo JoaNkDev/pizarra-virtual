@@ -1,439 +1,337 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Canvas, type CanvasHandle } from "@/components/Canvas";
-import { Toolbar } from "@/components/Toolbar";
-import { SetupBanner } from "@/components/SetupBanner";
-import { SchemaBanner } from "@/components/SchemaBanner";
-import { useWhiteboard } from "@/lib/useWhiteboard";
-import { useUserId } from "@/lib/useUserId";
 import { supabase } from "@/lib/supabase";
-import { COLORS, type Color, type Pt, type Stroke } from "@/lib/types";
-import { MAX_SCALE, MIN_SCALE } from "@/lib/config";
-import { EVT } from "@/lib/supabase";
-import type { Viewport } from "@/components/Canvas";
+import { useUserId } from "@/lib/useUserId";
+import { SetupBanner } from "@/components/SetupBanner";
 
-const STROKE_LIMIT = 1500;
+type Word = {
+  id: string;
+  userId: string;
+  words: string;
+  createdAt: number;
+};
+
+const MAX_WORDS = 2;
 
 export default function Home() {
   const userId = useUserId();
-  const [strokes, setStrokes] = useState<Stroke[]>([]);
-  const [color, setColor] = useState<Color>(COLORS[2]);
-  const [width, setWidth] = useState(8);
-  const [eraserWidth, setEraserWidth] = useState(28);
-  const [tool, setTool] = useState<"brush" | "eraser" | "pan">("brush");
-  const [viewport, setViewport] = useState<Viewport>(() => ({
-    tx: 0,
-    ty: 0,
-    scale: 1,
-  }));
-  const [schemaError, setSchemaError] = useState(false);
-  const [persistError, setPersistError] = useState<string | null>(null);
-  const myStrokesRef = useRef<Set<string>>(new Set());
-  const strokesByIdRef = useRef<Map<string, Stroke>>(new Map());
+  const [words, setWords] = useState<Word[]>([]);
+  const [input, setInput] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const isConfigured = Boolean(
+    process.env.NEXT_PUBLIC_SUPABASE_URL &&
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+  );
 
-  const canvasRef = useRef<CanvasHandle | null>(null);
-
-  const handleIncoming = useCallback((payload: unknown) => {
-    if (!payload || typeof payload !== "object") return;
-    const msg = payload as { event?: string; payload?: unknown };
-    const data = msg.payload as Record<string, unknown> | undefined;
-    if (!data) return;
-    const ev = msg.event;
-    switch (ev) {
-      case EVT.STROKE_START: {
-        const s = data as unknown as {
-          strokeId: string;
-          userId: string;
-          color: string;
-          width: number;
-          point: Pt;
-        };
-        setStrokes((prev) => {
-          if (prev.some((x) => x.id === s.strokeId)) return prev;
-          const next: Stroke = {
-            id: s.strokeId,
-            userId: s.userId,
-            color: s.color,
-            width: s.width,
-            points: [s.point],
-            createdAt: Date.now(),
-          };
-          return appendCap(next, prev);
-        });
-        break;
-      }
-      case EVT.STROKE_EXTEND: {
-        const e = data as unknown as {
-          strokeId: string;
-          userId: string;
-          point: Pt;
-        };
-        setStrokes((prev) =>
-          prev.map((s) =>
-            s.id === e.strokeId ? { ...s, points: [...s.points, e.point] } : s
-          )
-        );
-        break;
-      }
-      case EVT.STROKE_END: {
-        // Sender already persisted on their end. Don't persist again.
-        setStrokes((prev) => prev);
-        break;
-      }
-      case EVT.STROKE_DELETE: {
-        const d = data as unknown as {
-          userId: string;
-          strokeIds: string[];
-        };
-        if (!Array.isArray(d.strokeIds) || d.strokeIds.length === 0) return;
-        const idSet = new Set(d.strokeIds);
-        setStrokes((prev) => prev.filter((s) => !idSet.has(s.id)));
-        for (const id of d.strokeIds) {
-          strokesByIdRef.current.delete(id);
-          void supDeleteStroke(id);
-        }
-        break;
-      }
-      case EVT.UNDO: {
-        // Only honor undo for own strokes — protects other users' work.
-        const u = data as unknown as { userId: string; strokeId: string };
-        if (u.userId !== userId) return;
-        setStrokes((prev) => prev.filter((s) => s.id !== u.strokeId));
-        myStrokesRef.current.delete(u.strokeId);
-        void supDeleteStroke(u.strokeId);
-        break;
-      }
-      case EVT.SYNC_REQUEST: {
-        const req = data as unknown as { userId: string };
-        void supabaseFetchCurrent().then((payload) => {
-          if (!payload) return;
-          wbApiRef.current?.syncResponse({
-            userId: req.userId,
-            strokes: payload.strokes,
-          });
-        });
-        break;
-      }
-      case EVT.SYNC_RESPONSE: {
-        const resp = data as unknown as {
-          userId: string;
-          strokes: Stroke[];
-        };
-        if (Array.isArray(resp.strokes) && resp.strokes.length > 0) {
-          setStrokes((prev) => {
-            const map = new Map<string, Stroke>();
-            for (const s of prev) map.set(s.id, s);
-            for (const s of resp.strokes) {
-              if (!map.has(s.id)) map.set(s.id, s);
-            }
-            return Array.from(map.values())
-              .sort((a, b) => a.createdAt - b.createdAt)
-              .slice(-STROKE_LIMIT);
-          });
-        }
-        break;
-      }
-    }
-  }, [userId]);
-
-  const wbApi = useWhiteboard(userId, handleIncoming);
-  const wbApiRef = useRef(wbApi);
-  wbApiRef.current = wbApi;
-
-  // Load existing strokes from Supabase on mount
+  // Fetch + subscribe to all words
   useEffect(() => {
-    if (!supabase) return;
+    if (!supabase || !userId) return;
     let cancelled = false;
+
     void (async () => {
-      const { data: dbStrokes, error: e1 } = await supabase
-        .from("whiteboard_strokes")
+      const { data, error } = await supabase
+        .from("persona_words")
         .select("*")
-        .order("created_at", { ascending: false })
-        .limit(STROKE_LIMIT);
+        .order("created_at", { ascending: true });
       if (cancelled) return;
-      if (
-        e1?.code === "PGRST116" ||
-        /relation.*does not exist/i.test(String(e1?.message ?? ""))
-      ) {
-        setSchemaError(true);
-        return;
-      }
-      if (!e1 && dbStrokes) {
-        const mapped: Stroke[] = dbStrokes
-          .map((r) => ({
+      if (!error && data) {
+        setWords(
+          data.map((r) => ({
             id: r.id as string,
             userId: r.user_id as string,
-            color: r.color as string,
-            width: r.width as number,
-            points: ((r.points as unknown) as number[][]).map((p): Pt => [
-              p[0],
-              p[1],
-            ]),
+            words: r.words as string,
             createdAt: new Date(r.created_at as string).getTime(),
           }))
-          .reverse();
-        setStrokes(mapped);
-        for (const s of mapped) strokesByIdRef.current.set(s.id, s);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Surface persist errors
-  useEffect(() => {
-    const handler = (ev: Event) => {
-      const ce = ev as CustomEvent<string>;
-      setPersistError(ce.detail);
-      setTimeout(() => setPersistError(null), 4000);
-    };
-    window.addEventListener("pizarra:persist-error", handler);
-    return () => window.removeEventListener("pizarra:persist-error", handler);
-  }, []);
-
-  const effectiveColor = useMemo(
-    () => (tool === "eraser" ? "#ffffff" : color),
-    [tool, color]
-  );
-  const effectiveWidth = tool === "eraser" ? eraserWidth : width;
-  const isErasing = tool === "eraser";
-  const sliderMax = isErasing ? 80 : 9;
-  const sliderMin = isErasing ? 4 : 1;
-
-  const handleStrokeStart = useCallback(
-    (m: {
-      strokeId: string;
-      userId: string;
-      color: string;
-      width: number;
-      point: Pt;
-    }) => {
-      wbApi.strokeStart(m);
-      myStrokesRef.current.add(m.strokeId);
-      const ns: Stroke = {
-        id: m.strokeId,
-        userId: m.userId,
-        color: m.color,
-        width: m.width,
-        points: [m.point],
-        createdAt: Date.now(),
-      };
-      strokesByIdRef.current.set(m.strokeId, ns);
-      setStrokes((prev) => {
-        if (prev.some((s) => s.id === m.strokeId)) return prev;
-        return appendCap(ns, prev);
-      });
-    },
-    [wbApi]
-  );
-  const handleStrokeExtend = useCallback(
-    (strokeId: string, point: Pt, user: string) => {
-      wbApi.strokeExtend({ strokeId, userId: user, point });
-      if (user === userId) {
-        const cur = strokesByIdRef.current.get(strokeId);
-        if (cur) {
-          strokesByIdRef.current.set(strokeId, {
-            ...cur,
-            points: [...cur.points, point],
-          });
-        }
-        setStrokes((prev) =>
-          prev.map((s) =>
-            s.id === strokeId ? { ...s, points: [...s.points, point] } : s
-          )
         );
       }
-    },
-    [wbApi, userId]
-  );
-  const handleStrokeEnd = useCallback(
-    (strokeId: string, user: string) => {
-      wbApi.strokeEnd({ strokeId, userId: user });
-      if (user === userId) {
-        const s = strokesByIdRef.current.get(strokeId);
-        strokesByIdRef.current.delete(strokeId);
-        if (s) void persistStroke(s);
-      }
-    },
-    [wbApi, userId]
+    })();
+
+    const channel = supabase
+      .channel("persona:global")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "persona_words" },
+        (payload) => {
+          const r = payload.new as {
+            id: string;
+            user_id: string;
+            words: string;
+            created_at: string;
+          };
+          setWords((prev) =>
+            prev.some((w) => w.id === r.id)
+              ? prev
+              : [
+                  ...prev,
+                  {
+                    id: r.id,
+                    userId: r.user_id,
+                    words: r.words,
+                    createdAt: new Date(r.created_at).getTime(),
+                  },
+                ]
+          );
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "persona_words" },
+        (payload) => {
+          const r = payload.new as {
+            id: string;
+            user_id: string;
+            words: string;
+            created_at: string;
+          };
+          setWords((prev) =>
+            prev.map((w) =>
+              w.id === r.id
+                ? {
+                    ...w,
+                    words: r.words,
+                    createdAt: new Date(r.created_at).getTime(),
+                  }
+                : w
+            )
+          );
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "DELETE", schema: "public", table: "persona_words" },
+        (payload) => {
+          const old = payload.old as { id: string };
+          setWords((prev) => prev.filter((w) => w.id !== old.id));
+        }
+      )
+      .subscribe((status) => {
+        setConnected(status === "SUBSCRIBED");
+      });
+
+    return () => {
+      cancelled = true;
+      void channel.unsubscribe();
+    };
+  }, [userId]);
+
+  const myWord = useMemo(
+    () => words.find((w) => w.userId === userId) ?? null,
+    [words, userId]
   );
 
-  // Undo only your own last stroke
-  const lastOwnStroke = useMemo(() => {
-    for (let i = strokes.length - 1; i >= 0; i--) {
-      if (strokes[i].userId === userId) return strokes[i];
-    }
+  const validate = useCallback((text: string): string | null => {
+    const trimmed = text.trim();
+    if (!trimmed) return "Escribí al menos una palabra";
+    const parts = trimmed.split(/\s+/);
+    if (parts.length > MAX_WORDS) return `Máximo ${MAX_WORDS} palabras`;
     return null;
-  }, [strokes, userId]);
+  }, []);
 
-  const handleUndo = useCallback(() => {
-    if (!lastOwnStroke) return;
-    wbApi.undo({ userId, strokeId: lastOwnStroke.id });
-  }, [wbApi, userId, lastOwnStroke]);
-
-  const handleEraseEnd = useCallback(
-    (strokeIds: string[]) => {
-      if (strokeIds.length === 0) return;
-      const idSet = new Set(strokeIds);
-      // Sender side: also update local state and DB so the erased strokes
-      // don't reappear on the next redraw.
-      setStrokes((prev) => prev.filter((s) => !idSet.has(s.id)));
-      for (const id of strokeIds) {
-        strokesByIdRef.current.delete(id);
-        void supDeleteStroke(id);
+  const handleSubmit = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!supabase || !userId) return;
+      const trimmed = input.trim();
+      const err = validate(trimmed);
+      if (err) {
+        setError(err);
+        return;
       }
-      // Tell other clients
-      wbApi.strokeDelete({ userId, strokeIds });
+      setError(null);
+      setSubmitting(true);
+      const { error } = await supabase.from("persona_words").upsert(
+        {
+          user_id: userId,
+          words: trimmed,
+          created_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" }
+      );
+      setSubmitting(false);
+      if (error) {
+        setError(error.message);
+      } else {
+        setInput("");
+      }
     },
-    [wbApi, userId]
+    [input, userId, validate]
   );
 
-  const zoomBy = useCallback((factor: number) => {
-    setViewport((v) => {
-      const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, v.scale * factor));
-      if (newScale === v.scale) return v;
-      return { tx: v.tx, ty: v.ty, scale: newScale };
-    });
-  }, []);
-
-  const handleZoomIn = useCallback(() => zoomBy(1.2), [zoomBy]);
-  const handleZoomOut = useCallback(() => zoomBy(1 / 1.2), [zoomBy]);
-  const handleFit = useCallback(() => {
-    canvasRef.current?.fit();
-  }, []);
-
-  const handleDownload = useCallback(() => {
-    const canvas = document.querySelector("canvas") as HTMLCanvasElement | null;
-    if (!canvas) return;
-    const url = canvas.toDataURL("image/png");
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `pizarra-${new Date()
-      .toISOString()
-      .slice(0, 19)
-      .replace(/[:T]/g, "-")}.png`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  }, []);
-
-  if (!wbApi.isConfigured) {
-    return (
-      <SetupBanner
-        url={process.env.NEXT_PUBLIC_SUPABASE_URL}
-        key={process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "ok" : ""}
-      />
-    );
-  }
-
-  if (schemaError) {
-    return <SchemaBanner />;
+  if (!isConfigured) {
+    return <SetupBanner url={process.env.NEXT_PUBLIC_SUPABASE_URL} key={process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ? "ok" : ""} />;
   }
 
   return (
-    <main className="relative h-full w-full">
-      <div
-        className="absolute inset-0 pb-[140px] md:pb-0 md:pt-[124px]"
-        aria-label="Pizarra"
-      >
-        <Canvas
-          ref={canvasRef}
-          strokes={strokes}
-          myUserId={userId}
-          color={effectiveColor}
-          width={effectiveWidth}
-          tool={tool}
-          viewport={viewport}
-          onViewportChange={setViewport}
-          onStrokeStart={handleStrokeStart}
-          onStrokeExtend={handleStrokeExtend}
-          onStrokeEnd={handleStrokeEnd}
-          onEraseEnd={handleEraseEnd}
-        />
-      </div>
-
-      <Toolbar
-        color={color}
-        width={effectiveWidth}
-        widthMin={sliderMin}
-        widthMax={sliderMax}
-        widthLabel={isErasing ? "goma" : "grosor"}
-        tool={tool}
-        canUndo={Boolean(lastOwnStroke)}
-        peersCount={wbApi.peersCount}
-        connected={wbApi.connected}
-        viewport={viewport}
-        onColor={setColor}
-        onWidth={isErasing ? setEraserWidth : setWidth}
-        onTool={setTool}
-        onUndo={handleUndo}
-        onZoomIn={handleZoomIn}
-        onZoomOut={handleZoomOut}
-        onFit={handleFit}
-        onDownload={handleDownload}
-      />
-      {persistError && (
-        <div
-          role="alert"
-          className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-sm rounded-xl border border-rose-500/40 bg-rose-950/90 px-4 py-3 text-sm text-rose-100 shadow-lg"
-        >
-          <div className="font-semibold mb-1">No se pudo guardar el trazo</div>
-          <div className="opacity-80 break-words">{persistError}</div>
+    <main className="relative min-h-screen flex flex-col collage-bg">
+      {/* Header */}
+      <header className="px-5 pt-6 pb-3 md:px-10 md:pt-10 text-center">
+        <h1 className="text-2xl md:text-4xl font-bold tracking-tight leading-tight">
+          Describan a la persona que tienen adelante
+        </h1>
+        <div className="mt-3 flex items-center justify-center gap-2 text-[11px] uppercase tracking-wider text-white/50">
+          <span
+            className={`inline-block h-2 w-2 rounded-full ${
+              connected ? "bg-emerald-400" : "bg-rose-400"
+            }`}
+          />
+          <span>{connected ? "en vivo" : "conectando…"}</span>
+          <span>·</span>
+          <span>
+            {words.length} {words.length === 1 ? "descripción" : "descripciones"}
+          </span>
         </div>
-      )}
+      </header>
+
+      {/* Submit form */}
+      <section className="px-5 md:px-10 pb-4">
+        <form
+          onSubmit={handleSubmit}
+          className="mx-auto flex max-w-md flex-col gap-2"
+        >
+          <div className="flex gap-2">
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => {
+                setInput(e.target.value);
+                if (error) setError(null);
+              }}
+              placeholder={
+                myWord
+                  ? `Cambiar tu palabra (${myWord.words})`
+                  : "ej: muy simpática"
+              }
+              maxLength={40}
+              autoComplete="off"
+              className="flex-1 rounded-xl border border-border bg-panel px-4 py-3 text-base outline-none placeholder:text-white/30 focus:border-accent"
+            />
+            <button
+              type="submit"
+              disabled={submitting || !input.trim()}
+              className="rounded-xl bg-accent px-5 py-3 font-medium text-white transition-colors hover:bg-accent/90 disabled:opacity-40"
+            >
+              {myWord ? "Actualizar" : "Enviar"}
+            </button>
+          </div>
+          {error && (
+            <p className="text-xs text-rose-400 text-center">{error}</p>
+          )}
+          <p className="text-xs text-white/40 text-center">
+            Máximo {MAX_WORDS} palabras. {myWord ? "Podés cambiar la tuya." : "Anónimo."}
+          </p>
+        </form>
+      </section>
+
+      {/* Collage */}
+      <section className="relative flex-1 min-h-[60vh] overflow-hidden">
+        {words.length === 0 ? (
+          <div className="absolute inset-0 grid place-items-center text-white/30 text-sm">
+            Esperando las primeras descripciones…
+          </div>
+        ) : (
+          <Collage words={words} />
+        )}
+      </section>
     </main>
   );
 }
 
-function appendCap(newStroke: Stroke | null, list: Stroke[]): Stroke[] {
-  if (!newStroke) return list.slice(-STROKE_LIMIT);
-  const next = [...list, newStroke];
-  return next.length > STROKE_LIMIT ? next.slice(-STROKE_LIMIT) : next;
+function Collage({ words }: { words: Word[] }) {
+  return (
+    <div className="relative h-full w-full">
+      {words.map((w, i) => {
+        const layout = layoutFor(w.id, w.userId, i, words.length);
+        return (
+          <div
+            key={w.id}
+            className="absolute select-none"
+            style={{
+              left: `${layout.x}%`,
+              top: `${layout.y}%`,
+              transform: `translate(-50%, -50%) rotate(${layout.rot}deg)`,
+              fontSize: `${layout.size}px`,
+              color: layout.color,
+              fontWeight: layout.weight,
+              letterSpacing: "-0.01em",
+              lineHeight: 1.1,
+              fontFamily:
+                'Georgia, "Times New Roman", ui-serif, serif',
+              textShadow: "0 2px 12px rgba(0,0,0,0.45)",
+              maxWidth: "60vw",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {w.words}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
-async function persistStroke(s: Stroke) {
-  if (!supabase) return;
-  const { error } = await supabase.from("whiteboard_strokes").insert({
-    id: s.id,
-    user_id: s.userId,
-    color: s.color,
-    width: s.width,
-    points: s.points,
-  });
-  if (error) {
-    // Ignore duplicate (already persisted) — idempotent
-    if (error.code === "23505") return;
-    // eslint-disable-next-line no-console
-    console.error("[persist]", error);
-    window.dispatchEvent(
-      new CustomEvent("pizarra:persist-error", { detail: error.message })
-    );
+// Deterministic layout based on word id (stable across reloads)
+function layoutFor(
+  id: string,
+  userId: string,
+  index: number,
+  total: number
+): { x: number; y: number; rot: number; size: number; color: string; weight: number } {
+  const seed = hash(id);
+  const r = mulberry32(seed);
+  // Spread across canvas using poisson-like jitter from index
+  const cols = Math.max(1, Math.ceil(Math.sqrt(total)));
+  const row = Math.floor(index / cols);
+  const col = index % cols;
+  const baseX = ((col + 0.5) / cols) * 100;
+  const baseY = ((row + 0.5) / Math.max(1, Math.ceil(total / cols))) * 100;
+  const jitterX = (r() - 0.5) * 18;
+  const jitterY = (r() - 0.5) * 14;
+  const rot = (r() - 0.5) * 22; // -11°..+11°
+  const size = 28 + r() * 28; // 28..56px
+  const palette = [
+    "#ffffff",
+    "#ffd6a8",
+    "#ffc1cc",
+    "#c4faf8",
+    "#fdffb6",
+    "#a0c4ff",
+    "#bdb2ff",
+    "#ffadad",
+  ];
+  const color = palette[Math.floor(r() * palette.length)];
+  const weight = r() > 0.5 ? 600 : 700;
+  return {
+    x: clamp(baseX + jitterX, 5, 95),
+    y: clamp(baseY + jitterY, 8, 92),
+    rot,
+    size,
+    color,
+    weight,
+  };
+}
+
+function hash(s: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
   }
+  return h >>> 0;
 }
 
-async function supDeleteStroke(id: string) {
-  if (!supabase) return;
-  void supabase.from("whiteboard_strokes").delete().eq("id", id);
+function mulberry32(a: number) {
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
 
-async function supabaseFetchCurrent(): Promise<{ strokes: Stroke[] } | null> {
-  if (!supabase) return null;
-  const { data: dbStrokes } = await supabase
-    .from("whiteboard_strokes")
-    .select("*")
-    .order("created_at", { ascending: false })
-    .limit(STROKE_LIMIT);
-  const strokes: Stroke[] = (dbStrokes ?? [])
-    .map((r) => ({
-      id: r.id as string,
-      userId: r.user_id as string,
-      color: r.color as string,
-      width: r.width as number,
-      points: r.points as Pt[],
-      createdAt: new Date(r.created_at as string).getTime(),
-    }))
-    .reverse();
-  return { strokes };
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
 }
