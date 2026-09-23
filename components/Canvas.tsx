@@ -77,6 +77,7 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
   const panRef = useRef<{ cx: number; cy: number; tx: number; ty: number } | null>(null);
   const throttleRef = useRef(new Throttle(30));
   const [ready, setReady] = useState(false);
+  const [eraserCursor, setEraserCursor] = useState<{ x: number; y: number } | null>(null);
 
   useEffect(() => {
     strokesRef.current = strokes;
@@ -126,6 +127,25 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     window.addEventListener("resize", resize);
     return () => window.removeEventListener("resize", resize);
   }, [resize]);
+
+  // Eraser cursor overlay: track pointer globally so the indicator follows
+  // even when the cursor is stationary or moves slightly within a frame.
+  useEffect(() => {
+    if (tool !== "eraser") {
+      setEraserCursor(null);
+      return;
+    }
+    const onMove = (e: PointerEvent) => {
+      setEraserCursor({ x: e.clientX, y: e.clientY });
+    };
+    const onLeave = () => setEraserCursor(null);
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerleave", onLeave);
+    return () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerleave", onLeave);
+    };
+  }, [tool]);
 
   // Redraw on strokes change
   useEffect(() => {
@@ -440,6 +460,20 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
       >
         <canvas ref={canvasRef} className="block" />
       </div>
+      {eraserCursor && (
+        <div
+          aria-hidden
+          className="pointer-events-none fixed rounded-full border-2 border-accent bg-white/40"
+          style={{
+            left: eraserCursor.x - width / 2,
+            top: eraserCursor.y - width / 2,
+            width: width,
+            height: width,
+            zIndex: 20,
+            transition: "none",
+          }}
+        />
+      )}
     </div>
   );
 });

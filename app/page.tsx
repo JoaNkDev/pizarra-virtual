@@ -276,6 +276,15 @@ export default function Home() {
   const handleEraseEnd = useCallback(
     (strokeIds: string[]) => {
       if (strokeIds.length === 0) return;
+      const idSet = new Set(strokeIds);
+      // Sender side: also update local state and DB so the erased strokes
+      // don't reappear on the next redraw.
+      setStrokes((prev) => prev.filter((s) => !idSet.has(s.id)));
+      for (const id of strokeIds) {
+        strokesByIdRef.current.delete(id);
+        void supDeleteStroke(id);
+      }
+      // Tell other clients
       wbApi.strokeDelete({ userId, strokeIds });
     },
     [wbApi, userId]
