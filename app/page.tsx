@@ -77,12 +77,22 @@ export default function Home() {
         break;
       }
       case EVT.STROKE_END: {
-        const e = data as unknown as { strokeId: string; userId: string };
-        setStrokes((prev) => {
-          const s = prev.find((x) => x.id === e.strokeId);
-          if (s) void persistStroke(s);
-          return prev;
-        });
+        // Sender already persisted on their end. Don't persist again.
+        setStrokes((prev) => prev);
+        break;
+      }
+      case EVT.STROKE_DELETE: {
+        const d = data as unknown as {
+          userId: string;
+          strokeIds: string[];
+        };
+        if (!Array.isArray(d.strokeIds) || d.strokeIds.length === 0) return;
+        const idSet = new Set(d.strokeIds);
+        setStrokes((prev) => prev.filter((s) => !idSet.has(s.id)));
+        for (const id of d.strokeIds) {
+          strokesByIdRef.current.delete(id);
+          void supDeleteStroke(id);
+        }
         break;
       }
       case EVT.UNDO: {
@@ -263,6 +273,14 @@ export default function Home() {
     wbApi.undo({ userId, strokeId: lastOwnStroke.id });
   }, [wbApi, userId, lastOwnStroke]);
 
+  const handleEraseEnd = useCallback(
+    (strokeIds: string[]) => {
+      if (strokeIds.length === 0) return;
+      wbApi.strokeDelete({ userId, strokeIds });
+    },
+    [wbApi, userId]
+  );
+
   const zoomBy = useCallback((factor: number) => {
     setViewport((v) => {
       const newScale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, v.scale * factor));
@@ -323,6 +341,7 @@ export default function Home() {
           onStrokeStart={handleStrokeStart}
           onStrokeExtend={handleStrokeExtend}
           onStrokeEnd={handleStrokeEnd}
+          onEraseEnd={handleEraseEnd}
         />
       </div>
 
@@ -375,7 +394,8 @@ async function persistStroke(s: Stroke) {
     points: s.points,
   });
   if (error) {
-    // Surface to a global so we can debug from outside React.
+    // Ignore duplicate (already persisted) — idempotent
+    if (error.code === "23505") return;
     // eslint-disable-next-line no-console
     console.error("[persist]", error);
     window.dispatchEvent(

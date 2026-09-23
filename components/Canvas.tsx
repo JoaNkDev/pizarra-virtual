@@ -36,6 +36,7 @@ type Props = {
   onStrokeStart: (msg: StrokeStartMsg) => void;
   onStrokeExtend: (strokeId: string, point: Pt, userId: string) => void;
   onStrokeEnd: (strokeId: string, userId: string) => void;
+  onEraseEnd: (strokeIds: string[]) => void;
 };
 
 type Pointer = {
@@ -58,6 +59,7 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     onStrokeStart,
     onStrokeExtend,
     onStrokeEnd,
+    onEraseEnd,
   },
   ref
 ) {
@@ -70,6 +72,7 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
   const toolRef = useRef(tool);
   const viewportRef = useRef<Viewport>(viewport);
   const pointersRef = useRef<Map<number, Pointer>>(new Map());
+  const eraseStateRef = useRef<Map<number, { lastPx: number; lastPy: number; toDelete: Set<string> }>>(new Map());
   const lastDrawPtRef = useRef<Map<string, Pt>>(new Map());
   const panRef = useRef<{ cx: number; cy: number; tx: number; ty: number } | null>(null);
   const throttleRef = useRef(new Throttle(30));
@@ -181,6 +184,7 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
 
     const isPanTool = toolRef.current === "pan";
     const isMiddleClick = e.pointerType === "mouse" && e.button === 1;
+    const isEraser = toolRef.current === "eraser";
 
     pointersRef.current.set(e.pointerId, {
       id: e.pointerId,
@@ -192,12 +196,17 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     const count = pointersRef.current.size;
 
     if (count >= 2) {
-      // Switch everyone to pan, cancel any draws
+      // Switch everyone to pan, cancel any draws/erases
       for (const p of pointersRef.current.values()) {
         if (p.mode === "draw" && p.strokeId) {
           onStrokeEnd(p.strokeId, myUserId);
           lastDrawPtRef.current.delete(p.strokeId);
           p.strokeId = undefined;
+        }
+        if (eraseStateRef.current.has(p.id)) {
+          const es = eraseStateRef.current.get(p.id)!;
+          if (es.toDelete.size > 0) onEraseEnd(Array.from(es.toDelete));
+          eraseStateRef.current.delete(p.id);
         }
         p.mode = "pan";
       }
@@ -210,6 +219,23 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
 
     if (isPanTool || isMiddleClick) {
       startPan(e.clientX, e.clientY);
+      return;
+    }
+
+    // Erase mode: track eraser path + strokes to delete
+    if (isEraser) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const cp = getCanvasPoint(e, rect);
+      if (!cp) return;
+      eraseStateRef.current.set(e.pointerId, {
+        lastPx: cp.px,
+        lastPy: cp.py,
+        toDelete: new Set<string>(),
+      });
+      // Initial erase hit-test + paint preview
+      eraseAt(cp.px, cp.py, e.pointerId);
       return;
     }
 
@@ -244,12 +270,69 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
     });
   };
 
+  /**
+   * Erase at point (px, py) in logical pixels: paint white preview,
+   * and mark any nearby strokes for deletion.
+   */
+  const eraseAt = (px: number, py: number, pointerId: number) => {
+    const eraserRadius = widthRef.current / 2;
+    const ctx = ctxRef.current;
+    if (ctx && ready) {
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.arc(px, py, eraserRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    const es = eraseStateRef.current.get(pointerId);
+    if (!es) return;
+    const r2 = eraserRadius * eraserRadius;
+    for (const s of strokesRef.current) {
+      if (es.toDelete.has(s.id)) continue;
+      for (const [nx, ny] of s.points) {
+        const sx = nx * LOGICAL_W;
+        const sy = ny * LOGICAL_H;
+        const dx = sx - px;
+        const dy = sy - py;
+        if (dx * dx + dy * dy <= r2) {
+          es.toDelete.add(s.id);
+          break;
+        }
+      }
+    }
+  };
+
   const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const p = pointersRef.current.get(e.pointerId);
     if (!p) return;
     e.preventDefault();
     p.clientX = e.clientX;
     p.clientY = e.clientY;
+
+    // Eraser move: paint preview + hit-test
+    if (eraseStateRef.current.has(e.pointerId)) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const cp = getCanvasPoint(e, rect);
+      if (!cp) return;
+      const es = eraseStateRef.current.get(e.pointerId)!;
+      const ctx = ctxRef.current;
+      if (ctx && ready) {
+        drawSegment(
+          ctx,
+          [es.lastPx, es.lastPy],
+          [cp.px, cp.py],
+          "#ffffff",
+          widthRef.current,
+          LOGICAL_W,
+          LOGICAL_H
+        );
+      }
+      es.lastPx = cp.px;
+      es.lastPy = cp.py;
+      eraseAt(cp.px, cp.py, e.pointerId);
+      return;
+    }
 
     if (p.mode === "pan") {
       const start = panRef.current;
@@ -306,7 +389,12 @@ export const Canvas = forwardRef<CanvasHandle, Props>(function Canvas(
   const handlePointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     const p = pointersRef.current.get(e.pointerId);
     if (!p) return;
-    if (p.mode === "draw" && p.strokeId) {
+    // Eraser finalize
+    const es = eraseStateRef.current.get(e.pointerId);
+    if (es) {
+      if (es.toDelete.size > 0) onEraseEnd(Array.from(es.toDelete));
+      eraseStateRef.current.delete(e.pointerId);
+    } else if (p.mode === "draw" && p.strokeId) {
       onStrokeEnd(p.strokeId, myUserId);
       lastDrawPtRef.current.delete(p.strokeId);
     }

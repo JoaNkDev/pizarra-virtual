@@ -82,6 +82,11 @@ export function useWhiteboard(userId: string, onIncoming: IncomingHandler) {
     (m: StrokeEndMsg) => send(EVT.STROKE_END, m),
     [send]
   );
+  const strokeDelete = useCallback(
+    (m: { userId: string; strokeIds: string[] }) =>
+      send(EVT.STROKE_DELETE, m),
+    [send]
+  );
   const undo = useCallback((m: UndoMsg) => send(EVT.UNDO, m), [send]);
   const syncResponse = useCallback(
     (m: SyncResponseMsg) => send(EVT.SYNC_RESPONSE, m),
@@ -95,6 +100,7 @@ export function useWhiteboard(userId: string, onIncoming: IncomingHandler) {
     strokeStart,
     strokeExtend,
     strokeEnd,
+    strokeDelete,
     undo,
     syncResponse,
     rawChannel: channelRef.current,

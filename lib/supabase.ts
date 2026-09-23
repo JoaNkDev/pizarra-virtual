@@ -35,6 +35,7 @@ export const EVT = {
   STROKE_START: "stroke-start",
   STROKE_EXTEND: "stroke-extend",
   STROKE_END: "stroke-end",
+  STROKE_DELETE: "stroke-delete",
   CLEAR: "clear",
   UNDO: "undo",
   TIMER: "timer",
