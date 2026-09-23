@@ -20,6 +20,7 @@ export default function Home() {
   const [strokes, setStrokes] = useState<Stroke[]>([]);
   const [color, setColor] = useState<Color>(COLORS[2]);
   const [width, setWidth] = useState(8);
+  const [eraserWidth, setEraserWidth] = useState(28);
   const [tool, setTool] = useState<"brush" | "eraser" | "pan">("brush");
   const [viewport, setViewport] = useState<Viewport>(() => ({
     tx: 0,
@@ -27,7 +28,9 @@ export default function Home() {
     scale: 1,
   }));
   const [schemaError, setSchemaError] = useState(false);
+  const [persistError, setPersistError] = useState<string | null>(null);
   const myStrokesRef = useRef<Set<string>>(new Set());
+  const strokesByIdRef = useRef<Map<string, Stroke>>(new Map());
 
   const canvasRef = useRef<CanvasHandle | null>(null);
 
@@ -161,6 +164,7 @@ export default function Home() {
           }))
           .reverse();
         setStrokes(mapped);
+        for (const s of mapped) strokesByIdRef.current.set(s.id, s);
       }
     })();
     return () => {
@@ -168,10 +172,25 @@ export default function Home() {
     };
   }, []);
 
+  // Surface persist errors
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const ce = ev as CustomEvent<string>;
+      setPersistError(ce.detail);
+      setTimeout(() => setPersistError(null), 4000);
+    };
+    window.addEventListener("pizarra:persist-error", handler);
+    return () => window.removeEventListener("pizarra:persist-error", handler);
+  }, []);
+
   const effectiveColor = useMemo(
     () => (tool === "eraser" ? "#ffffff" : color),
     [tool, color]
   );
+  const effectiveWidth = tool === "eraser" ? eraserWidth : width;
+  const isErasing = tool === "eraser";
+  const sliderMax = isErasing ? 80 : 9;
+  const sliderMin = isErasing ? 4 : 1;
 
   const handleStrokeStart = useCallback(
     (m: {
@@ -183,16 +202,17 @@ export default function Home() {
     }) => {
       wbApi.strokeStart(m);
       myStrokesRef.current.add(m.strokeId);
+      const ns: Stroke = {
+        id: m.strokeId,
+        userId: m.userId,
+        color: m.color,
+        width: m.width,
+        points: [m.point],
+        createdAt: Date.now(),
+      };
+      strokesByIdRef.current.set(m.strokeId, ns);
       setStrokes((prev) => {
         if (prev.some((s) => s.id === m.strokeId)) return prev;
-        const ns: Stroke = {
-          id: m.strokeId,
-          userId: m.userId,
-          color: m.color,
-          width: m.width,
-          points: [m.point],
-          createdAt: Date.now(),
-        };
         return appendCap(ns, prev);
       });
     },
@@ -202,6 +222,13 @@ export default function Home() {
     (strokeId: string, point: Pt, user: string) => {
       wbApi.strokeExtend({ strokeId, userId: user, point });
       if (user === userId) {
+        const cur = strokesByIdRef.current.get(strokeId);
+        if (cur) {
+          strokesByIdRef.current.set(strokeId, {
+            ...cur,
+            points: [...cur.points, point],
+          });
+        }
         setStrokes((prev) =>
           prev.map((s) =>
             s.id === strokeId ? { ...s, points: [...s.points, point] } : s
@@ -215,11 +242,9 @@ export default function Home() {
     (strokeId: string, user: string) => {
       wbApi.strokeEnd({ strokeId, userId: user });
       if (user === userId) {
-        setStrokes((prev) => {
-          const s = prev.find((x) => x.id === strokeId);
-          if (s) void persistStroke(s);
-          return prev;
-        });
+        const s = strokesByIdRef.current.get(strokeId);
+        strokesByIdRef.current.delete(strokeId);
+        if (s) void persistStroke(s);
       }
     },
     [wbApi, userId]
@@ -291,7 +316,7 @@ export default function Home() {
           strokes={strokes}
           myUserId={userId}
           color={effectiveColor}
-          width={width}
+          width={effectiveWidth}
           tool={tool}
           viewport={viewport}
           onViewportChange={setViewport}
@@ -303,14 +328,17 @@ export default function Home() {
 
       <Toolbar
         color={color}
-        width={width}
+        width={effectiveWidth}
+        widthMin={sliderMin}
+        widthMax={sliderMax}
+        widthLabel={isErasing ? "goma" : "grosor"}
         tool={tool}
         canUndo={Boolean(lastOwnStroke)}
         peersCount={wbApi.peersCount}
         connected={wbApi.connected}
         viewport={viewport}
         onColor={setColor}
-        onWidth={setWidth}
+        onWidth={isErasing ? setEraserWidth : setWidth}
         onTool={setTool}
         onUndo={handleUndo}
         onZoomIn={handleZoomIn}
@@ -318,6 +346,15 @@ export default function Home() {
         onFit={handleFit}
         onDownload={handleDownload}
       />
+      {persistError && (
+        <div
+          role="alert"
+          className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-w-sm rounded-xl border border-rose-500/40 bg-rose-950/90 px-4 py-3 text-sm text-rose-100 shadow-lg"
+        >
+          <div className="font-semibold mb-1">No se pudo guardar el trazo</div>
+          <div className="opacity-80 break-words">{persistError}</div>
+        </div>
+      )}
     </main>
   );
 }
@@ -330,13 +367,21 @@ function appendCap(newStroke: Stroke | null, list: Stroke[]): Stroke[] {
 
 async function persistStroke(s: Stroke) {
   if (!supabase) return;
-  void supabase.from("whiteboard_strokes").insert({
+  const { error } = await supabase.from("whiteboard_strokes").insert({
     id: s.id,
     user_id: s.userId,
     color: s.color,
     width: s.width,
     points: s.points,
   });
+  if (error) {
+    // Surface to a global so we can debug from outside React.
+    // eslint-disable-next-line no-console
+    console.error("[persist]", error);
+    window.dispatchEvent(
+      new CustomEvent("pizarra:persist-error", { detail: error.message })
+    );
+  }
 }
 
 async function supDeleteStroke(id: string) {

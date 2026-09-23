@@ -6,6 +6,9 @@ import type { Viewport } from "./Canvas";
 type Props = {
   color: Color | string;
   width: number;
+  widthMin: number;
+  widthMax: number;
+  widthLabel: string;
   tool: "brush" | "eraser" | "pan";
   canUndo: boolean;
   peersCount: number;
@@ -24,6 +27,9 @@ type Props = {
 export function Toolbar({
   color,
   width,
+  widthMin,
+  widthMax,
+  widthLabel,
   tool,
   canUndo,
   peersCount,
@@ -244,17 +250,17 @@ export function Toolbar({
       {/* Width row */}
       <div className="flex items-center gap-3 px-1">
         <span className="text-[11px] uppercase tracking-wider text-white/50 w-12">
-          grosor
+          {widthLabel}
         </span>
         <input
           type="range"
-          min={1}
-          max={9}
+          min={widthMin}
+          max={widthMax}
           step={1}
           value={width}
           onChange={(e) => onWidth(Number(e.target.value))}
           className="flex-1 accent-accent"
-          aria-label="grosor del pincel"
+          aria-label={`${widthLabel} del pincel`}
         />
         <span className="text-[11px] tabular-nums text-white/50 w-6 text-right">
           {width}
