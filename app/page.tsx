@@ -1,21 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { supabase } from "@/lib/supabase";
-import { useUserId } from "@/lib/useUserId";
 import { SetupBanner } from "@/components/SetupBanner";
 
 type Word = {
   id: string;
-  userId: string;
   words: string;
   createdAt: number;
 };
 
-const MAX_WORDS = 2;
-
 export default function Home() {
-  const userId = useUserId();
   const [words, setWords] = useState<Word[]>([]);
   const [input, setInput] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -26,24 +21,22 @@ export default function Home() {
       process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
   );
 
-  // Fetch + subscribe to all words
+  // Initial fetch + realtime subscription + polling fallback
   useEffect(() => {
-    if (!supabase || !userId) return;
+    if (!supabase) return;
     let cancelled = false;
 
     const loadAll = async () => {
-      if (cancelled) return;
-      if (!supabase) return;
+      if (cancelled || !supabase) return;
       const { data, error } = await supabase
         .from("persona_words")
-        .select("*")
+        .select("id, words, created_at")
         .order("created_at", { ascending: true });
       if (cancelled) return;
       if (!error && data) {
         setWords(
           data.map((r) => ({
             id: r.id as string,
-            userId: r.user_id as string,
             words: r.words as string,
             createdAt: new Date(r.created_at as string).getTime(),
           }))
@@ -61,7 +54,6 @@ export default function Home() {
         (payload) => {
           const r = payload.new as {
             id: string;
-            user_id: string;
             words: string;
             created_at: string;
           };
@@ -72,34 +64,10 @@ export default function Home() {
                   ...prev,
                   {
                     id: r.id,
-                    userId: r.user_id,
                     words: r.words,
                     createdAt: new Date(r.created_at).getTime(),
                   },
                 ]
-          );
-        }
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "persona_words" },
-        (payload) => {
-          const r = payload.new as {
-            id: string;
-            user_id: string;
-            words: string;
-            created_at: string;
-          };
-          setWords((prev) =>
-            prev.map((w) =>
-              w.id === r.id
-                ? {
-                    ...w,
-                    words: r.words,
-                    createdAt: new Date(r.created_at).getTime(),
-                  }
-                : w
-            )
           );
         }
       )
@@ -115,28 +83,17 @@ export default function Home() {
         setConnected(status === "SUBSCRIBED");
       });
 
-    // Polling fallback: every 3s, refetch the full list. Guarantees the
-    // collage always reflects the latest state even if realtime events miss.
+    // Polling fallback every 2s — guarantees the collage always reflects
+    // every word regardless of realtime delivery.
     const pollId = setInterval(() => {
       void loadAll();
-    }, 3000);
+    }, 2000);
 
     return () => {
       cancelled = true;
       clearInterval(pollId);
       void channel.unsubscribe();
     };
-  }, [userId]);
-
-  // Server tracks "yours" by IP via the RPC; we don't know our IP client-side
-  // (and don't need to for UI). Each submit upserts the IP's row.
-
-  const validate = useCallback((text: string): string | null => {
-    const trimmed = text.trim();
-    if (!trimmed) return "Escribí al menos una palabra";
-    const parts = trimmed.split(/\s+/);
-    if (parts.length > MAX_WORDS) return `Máximo ${MAX_WORDS} palabras`;
-    return null;
   }, []);
 
   const handleSubmit = useCallback(
@@ -144,16 +101,19 @@ export default function Home() {
       e.preventDefault();
       if (!supabase) return;
       const trimmed = input.trim();
-      const err = validate(trimmed);
-      if (err) {
-        setError(err);
+      if (!trimmed) {
+        setError("Escribí algo");
+        return;
+      }
+      if (trimmed.length > 200) {
+        setError("Máximo 200 caracteres");
         return;
       }
       setError(null);
       setSubmitting(true);
-      // Server-side enforced: max 2 words, unique per IP.
-      const { error } = await supabase.rpc("submit_word", {
-        p_words: trimmed,
+      const { error } = await supabase.from("persona_words").insert({
+        words: trimmed,
+        created_at: new Date().toISOString(),
       });
       setSubmitting(false);
       if (error) {
@@ -162,7 +122,7 @@ export default function Home() {
         setInput("");
       }
     },
-    [input, validate]
+    [input]
   );
 
   if (!isConfigured) {
@@ -185,7 +145,7 @@ export default function Home() {
           <span>{connected ? "en vivo" : "conectando…"}</span>
           <span>·</span>
           <span>
-            {words.length} {words.length === 1 ? "descripción" : "descripciones"}
+            {words.length} {words.length === 1 ? "palabra" : "palabras"}
           </span>
         </div>
       </header>
@@ -205,7 +165,7 @@ export default function Home() {
                 if (error) setError(null);
               }}
               placeholder="ej: muy simpática"
-              maxLength={40}
+              maxLength={200}
               autoComplete="off"
               className="flex-1 rounded-xl border border-border bg-panel px-4 py-3 text-base outline-none placeholder:text-white/30 focus:border-accent"
             />
@@ -220,9 +180,7 @@ export default function Home() {
           {error && (
             <p className="text-xs text-rose-400 text-center">{error}</p>
           )}
-          <p className="text-xs text-white/40 text-center">
-            Máximo {MAX_WORDS} palabras. Anónimo — un envío por IP.
-          </p>
+          <p className="text-xs text-white/40 text-center">Anónimo. Cada envío agrega una palabra al collage.</p>
         </form>
       </section>
 
@@ -269,8 +227,6 @@ function Collage({ words }: { words: Word[] }) {
   );
 }
 
-// Deterministic per-word style — stable across reloads.
-// No rotation so words look like they were written; size/color vary for collage feel.
 function layoutFor(id: string): {
   size: number;
   color: string;
@@ -278,7 +234,7 @@ function layoutFor(id: string): {
 } {
   const seed = hash(id);
   const r = mulberry32(seed);
-  const size = 30 + r() * 18; // 30..48px (readable range)
+  const size = 30 + r() * 18;
   const palette = [
     "#ffffff",
     "#ffd6a8",
@@ -311,8 +267,4 @@ function mulberry32(a: number) {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
 }
