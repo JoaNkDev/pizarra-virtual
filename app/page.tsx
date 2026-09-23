@@ -31,7 +31,9 @@ export default function Home() {
     if (!supabase || !userId) return;
     let cancelled = false;
 
-    void (async () => {
+    const loadAll = async () => {
+      if (cancelled) return;
+      if (!supabase) return;
       const { data, error } = await supabase
         .from("persona_words")
         .select("*")
@@ -47,7 +49,9 @@ export default function Home() {
           }))
         );
       }
-    })();
+    };
+
+    void loadAll();
 
     const channel = supabase
       .channel("persona:global")
@@ -111,8 +115,15 @@ export default function Home() {
         setConnected(status === "SUBSCRIBED");
       });
 
+    // Polling fallback: every 3s, refetch the full list. Guarantees the
+    // collage always reflects the latest state even if realtime events miss.
+    const pollId = setInterval(() => {
+      void loadAll();
+    }, 3000);
+
     return () => {
       cancelled = true;
+      clearInterval(pollId);
       void channel.unsubscribe();
     };
   }, [userId]);
